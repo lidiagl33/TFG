@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/rand"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v3/ckks"
 	"github.com/tuneinsight/lattigo/v3/dckks"
@@ -10,6 +12,18 @@ import (
 	"github.com/tuneinsight/lattigo/v3/rlwe"
 	"github.com/tuneinsight/lattigo/v3/utils"
 )
+
+func runTimed(f func()) time.Duration {
+	start := time.Now()
+	f()
+	return time.Since(start)
+}
+
+func runTimedParty(f func(), N int) time.Duration {
+	start := time.Now()
+	f()
+	return time.Duration(time.Since(start).Nanoseconds() / int64(N))
+}
 
 type party struct {
 	sk         *rlwe.SecretKey
@@ -26,7 +40,22 @@ type party struct {
 	NumCol int
 }
 
-func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][columns]*/, finalResiduals [][][]PixelGray /*[image][rows][columns]*/, N int /*numTestImages*/) []float64 {
+var elapsedEncryptParty time.Duration
+var elapsedEncryptCloud time.Duration
+var elapsedCKGCloud time.Duration
+var elapsedCKGParty time.Duration
+var elapsedRKGCloud time.Duration
+var elapsedRKGParty time.Duration
+var elapsedRTGCloud time.Duration // tiempos rotación
+var elapsedRTGParty time.Duration // tiempos rotación
+var elapsedPCKSCloud time.Duration
+var elapsedPCKSParty time.Duration
+var elapsedEvalCloudCPU time.Duration
+var elapsedEvalParty time.Duration
+var elapsedDecCloud time.Duration
+var elapsedDecParty time.Duration
+
+func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][columns]*/, finalResiduals [][][]PixelGray /*[image][rows][columns]*/, N int /*numTestImages*/) ([]float64, []float64) {
 
 	// VALUES IN A CIPHERTEXT:
 	// with CKKS -> 2^LogSlots (here LogSlots = 11 => 2^11 = 2048 values)
@@ -60,7 +89,7 @@ func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][c
 	P := genparties(params, N)
 
 	// Assign inputs (each residual to each user/party and the estimation of the prnu to the first one)
-	getInputs(P, finalResiduals, finalPrnu)
+	expRes := getInputs(P, finalResiduals, finalPrnu)
 
 	// 1) Collective public key generation
 	pk := ckgphase(params, crs, P)
@@ -71,8 +100,14 @@ func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][c
 	// 3) Collective rotation keys generation
 	rtk := rtkphase(params, crs, P)
 
+	fmt.Printf("\tSETUP done (cloud: %s, party: %s)\n",
+		elapsedRKGCloud+elapsedCKGCloud+elapsedRTGCloud, elapsedRKGParty+elapsedCKGParty+elapsedRTGParty)
+
 	// gets encrypted residuals
 	encInputs := encPhase(params, P, pk, encoder)
+
+	fmt.Printf("\tENCRYPTION done (cloud: %s, party: %s)\n",
+		elapsedEncryptCloud, elapsedEncryptParty)
 
 	// Homomorphic additions of the ciphertexts to obtain the ENCODED PREDICTION
 	encRes := evalPhase(params, encInputs, rlk, rtk) // matrix of ciphertexts
@@ -80,6 +115,9 @@ func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][c
 	// SIGUIENTE MEJORA -> usar extractLWEsample para optimizar (1) evita "innersum" (se extra el coeficiente de continua), y (2) el descifrado y la comunicación mejoran
 	// key switching protocol -> encode over tpk
 	encOut := pcksPhase(params, tpk, encRes, P) // array of ciphertexts -> ALL THE SAME
+
+	fmt.Printf("\tEVALUATION + KEY SWITCHING done (cloud: %s, party: %s)\n",
+		elapsedEvalCloudCPU+elapsedPCKSCloud, elapsedEvalParty+elapsedPCKSParty)
 
 	// Decrypt the result with the target secret key
 	fmt.Print("\n> Decrypt Phase\n")
@@ -91,9 +129,14 @@ func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][c
 		ptres[i] = ckks.NewPlaintext(params, 1, params.DefaultScale())
 	}
 
-	for i := range encOut {
-		decryptor.Decrypt(encOut[i], ptres[i])
-	}
+	elapsedDecParty = runTimed(func() {
+		for i := range encOut {
+			decryptor.Decrypt(encOut[i], ptres[i])
+		}
+	})
+
+	elapsedDecCloud = time.Duration(0)
+	fmt.Printf("\tDECRYPTION done (cloud: %s, party: %s)\n", elapsedDecCloud, elapsedDecParty)
 
 	// results of the encrypted prediction
 	res := make([]float64, N) // len=N => SCORES (one per each residual)
@@ -106,7 +149,7 @@ func getEncryptedPrediction(finalPrnu [][]PixelGray /*estimation user1: [rows][c
 
 	fmt.Print("\n> Finish Encryption\n\n")
 
-	return res
+	return res, expRes
 }
 
 func genparties(params ckks.Parameters, N int) []*party {
@@ -123,7 +166,7 @@ func genparties(params ckks.Parameters, N int) []*party {
 	return P
 }
 
-func getInputs(p []*party, residuals [][][]PixelGray, finalPrnus [][]PixelGray) {
+func getInputs(p []*party, residuals [][][]PixelGray, finalPrnus [][]PixelGray) (expRes []float64) {
 
 	// we suppose only 1 ESTIMATION of the prnu (1 user)
 
@@ -143,7 +186,8 @@ func getInputs(p []*party, residuals [][][]PixelGray, finalPrnus [][]PixelGray) 
 			for j := 0; j < len(finalPrnus); j++ {
 				for k := 0; k < len(finalPrnus[0]); k++ {
 					// asigns the estimation to the first party
-					p[i].input[j][k] = finalPrnus[j][k].pix
+					//p[i].input[j][k] = finalPrnus[j][k].pix
+					p[i].input[j][k] = rand.Float64() * 255.0 //p[i].input[j][k] = utils.RandFloat64(0, 0xff) // random estimation
 				}
 			}
 		} else {
@@ -160,6 +204,26 @@ func getInputs(p []*party, residuals [][][]PixelGray, finalPrnus [][]PixelGray) 
 
 	}
 
+	//Allocate memory for Expected Results -> Num Parties - 1 x params.N() -> cada fila el mismo valor repetido
+	expRes = make([]float64, len(p)-1)
+
+	//Generate Aggregation Expected Results
+	for i, pi := range p[1:] { // desde p[1] hasta p[len(p) - 1], hay que comparar con p[0]
+		//l.Printf("vuelta: %d \n", i)
+		for j := range pi.input {
+			for k := range pi.input[j] {
+				//expRes[i][0] += (pi.input[j][k] * P[0].input[j][k]) % params.T()
+				expRes[i] += (pi.input[j][k] * p[0].input[j][k])
+				//expRes[i][0] %= params.T()
+			}
+		}
+		//for j := 1; j < params.N(); j++ {
+		//	expRes[i][j] = expRes[i][0]
+		//}
+	}
+
+	return expRes
+
 }
 
 func ckgphase(params ckks.Parameters, crs utils.PRNG, P []*party) *rlwe.PublicKey {
@@ -173,17 +237,22 @@ func ckgphase(params ckks.Parameters, crs utils.PRNG, P []*party) *rlwe.PublicKe
 
 	crp := ckg.SampleCRP(crs)
 
-	for _, pi := range P {
-		ckg.GenShare(pi.sk, crp, pi.ckgShare)
-	}
+	elapsedCKGParty = runTimedParty(func() {
+		for _, pi := range P {
+			ckg.GenShare(pi.sk, crp, pi.ckgShare)
+		}
+	}, len(P))
 
 	pk := ckks.NewPublicKey(params)
 
-	for _, pi := range P {
-		ckg.AggregateShare(pi.ckgShare, ckgCombined, ckgCombined)
-	}
+	elapsedCKGCloud = runTimed(func() {
+		for _, pi := range P {
+			ckg.AggregateShare(pi.ckgShare, ckgCombined, ckgCombined)
+		}
+		ckg.GenPublicKey(ckgCombined, crp, pk)
+	})
 
-	ckg.GenPublicKey(ckgCombined, crp, pk)
+	fmt.Printf("\tckgphase done (cloud: %s, party: %s)\n", elapsedCKGCloud, elapsedCKGParty)
 
 	return pk
 }
@@ -199,25 +268,34 @@ func rkgphase(params ckks.Parameters, crs utils.PRNG, P []*party) *rlwe.Relinear
 
 	crp := rkg.SampleCRP(crs)
 
-	for _, pi := range P {
-		rkg.GenShareRoundOne(pi.sk, crp, pi.rlkEphemSk, pi.rkgShareOne)
-	}
+	elapsedRKGParty = runTimedParty(func() {
+		for _, pi := range P {
+			rkg.GenShareRoundOne(pi.sk, crp, pi.rlkEphemSk, pi.rkgShareOne)
+		}
+	}, len(P))
 
-	for _, pi := range P {
-		rkg.AggregateShare(pi.rkgShareOne, rkgCombined1, rkgCombined1)
-	}
+	elapsedRKGCloud = runTimed(func() {
+		for _, pi := range P {
+			rkg.AggregateShare(pi.rkgShareOne, rkgCombined1, rkgCombined1)
+		}
+	})
 
-	for _, pi := range P {
-		rkg.GenShareRoundTwo(pi.rlkEphemSk, pi.sk, rkgCombined1, pi.rkgShareTwo)
-	}
+	elapsedRKGParty += runTimedParty(func() {
+		for _, pi := range P {
+			rkg.GenShareRoundTwo(pi.rlkEphemSk, pi.sk, rkgCombined1, pi.rkgShareTwo)
+		}
+	}, len(P))
 
 	rlk := ckks.NewRelinearizationKey(params)
 
-	for _, pi := range P {
-		rkg.AggregateShare(pi.rkgShareTwo, rkgCombined2, rkgCombined2)
-	}
+	elapsedRKGCloud += runTimed(func() {
+		for _, pi := range P {
+			rkg.AggregateShare(pi.rkgShareTwo, rkgCombined2, rkgCombined2)
+		}
+		rkg.GenRelinearizationKey(rkgCombined1, rkgCombined2, rlk)
+	})
 
-	rkg.GenRelinearizationKey(rkgCombined1, rkgCombined2, rlk)
+	fmt.Printf("\trkgphase done (cloud: %s, party: %s)\n", elapsedRKGCloud, elapsedRKGParty)
 
 	return rlk
 }
@@ -239,15 +317,21 @@ func rtkphase(params ckks.Parameters, crs utils.PRNG, P []*party) *rlwe.Rotation
 
 		crp := rtg.SampleCRP(crs)
 
-		for _, pi := range P {
-			rtg.GenShare(pi.sk, galEl, crp, pi.rtgShare)
-		}
+		elapsedRTGParty += runTimedParty(func() {
+			for _, pi := range P {
+				rtg.GenShare(pi.sk, galEl, crp, pi.rtgShare)
+			}
+		}, len(P))
 
-		for _, pi := range P {
-			rtg.AggregateShare(pi.rtgShare, rtgShareCombined, rtgShareCombined)
-		}
-		rtg.GenRotationKey(rtgShareCombined, crp, rotKeySet.Keys[galEl])
+		elapsedRTGCloud += runTimed(func() {
+			for _, pi := range P {
+				rtg.AggregateShare(pi.rtgShare, rtgShareCombined, rtgShareCombined)
+			}
+			rtg.GenRotationKey(rtgShareCombined, crp, rotKeySet.Keys[galEl])
+		})
 	}
+
+	fmt.Printf("\trtkphase done (cloud: %s, party %s)\n", elapsedRTGCloud, elapsedRTGParty)
 
 	return rotKeySet
 }
@@ -284,31 +368,36 @@ func encPhase(params ckks.Parameters, P []*party, pk *rlwe.PublicKey, encoder ck
 	pt := ckks.NewPlaintext(params, 1, params.DefaultScale())
 
 	// create cyphertexts -> encrypt residuals and estimation
-	for i, pi := range P {
-		for j := 0; j < NumRowEncIn; j++ {
-			for k := 0; k < NumColEncIn; k++ {
+	elapsedEncryptParty = runTimedParty(func() {
+		for i, pi := range P {
+			for j := 0; j < NumRowEncIn; j++ {
+				for k := 0; k < NumColEncIn; k++ {
 
-				// rellenar con ceros el ciphertext (si es más grande que los elementos que quedan por cifrar)
-				if (k+1)*params.Slots() > len(pi.input[j]) {
+					// rellenar con ceros el ciphertext (si es más grande que los elementos que quedan por cifrar)
+					if (k+1)*params.Slots() > len(pi.input[j]) {
 
-					zeros := (k+1)*params.Slots() - len(pi.input[j]) // number of zeros needed
-					//fmt.Printf("Number of 0s needed to fill the ciphertext: %d\n", zeros)
+						zeros := (k+1)*params.Slots() - len(pi.input[j]) // number of zeros needed
+						//fmt.Printf("Number of 0s needed to fill the ciphertext: %d\n", zeros)
 
-					add := make([]float64, zeros) // slice of 0s
-					pi.input[j] = append(pi.input[j], add...)
+						add := make([]float64, zeros) // slice of 0s
+						pi.input[j] = append(pi.input[j], add...)
+					}
+
+					//fmt.Printf("SIZE EACH ROW: %d\n", len(pi.input[j][(k*params.Slots()):((k+1)*params.Slots()-1)]))
+					//fmt.Printf("values are %d y %d\n", k*params.Slots(), (k+1)*params.Slots())
+					//fmt.Printf("size total row %d\n", len(pi.input[j]))
+
+					// returns the data in a Plaintext, now it can pass it to the function Encrypt
+					encoder.Encode(pi.input[j][(k*params.Slots()):((k+1)*params.Slots())], pt, params.LogSlots()) // go indexes [0:n] as the values 0, 1, ..., n - 1
+					// encrypts the plaintex "pt" into a ciphertext
+					encryptor.Encrypt(pt, encInputs[i][j][k])
 				}
-
-				//fmt.Printf("SIZE EACH ROW: %d\n", len(pi.input[j][(k*params.Slots()):((k+1)*params.Slots()-1)]))
-				//fmt.Printf("values are %d y %d\n", k*params.Slots(), (k+1)*params.Slots())
-				//fmt.Printf("size total row %d\n", len(pi.input[j]))
-
-				// returns the data in a Plaintext, now it can pass it to the function Encrypt
-				encoder.Encode(pi.input[j][(k*params.Slots()):((k+1)*params.Slots())], pt, params.LogSlots()) // go indexes [0:n] as the values 0, 1, ..., n - 1
-				// encrypts the plaintex "pt" into a ciphertext
-				encryptor.Encrypt(pt, encInputs[i][j][k])
 			}
 		}
-	}
+	}, len(P))
+
+	elapsedEncryptCloud = time.Duration(0)
+	fmt.Printf("\tencPhase done (cloud: %s, party: %s)\n", elapsedEncryptCloud, elapsedEncryptParty)
 
 	return
 }
@@ -351,32 +440,37 @@ func evalPhase(params ckks.Parameters, encInputs [][][]*ckks.Ciphertext, rlk *rl
 	// used after to make the different operations between the ciphertexts
 	evaluator := ckks.NewEvaluator(params, rlwe.EvaluationKey{Rlk: rlk, Rtks: rtk}) // if using evaluator.innersum, we have to generate the power-of-two rotations
 
-	for i := 1; i < len(encInputs); i++ { // party (begining from the second) => encInputs[0] = estimation of the prnu
-		for j := 0; j < len(encInputs[0]); j++ { // NumRowEncIn
-			for k := 0; k < len(encInputs[0][0]); k++ { // NumColEncIn
-				//evaluator.Add(encRes[j][k], encInputs[i][j][k], encRes[j][k]) => encoded aggregation
+	elapsedEvalCloudCPU = runTimed(func() {
+		for i := 1; i < len(encInputs); i++ { // party (begining from the second) => encInputs[0] = estimation of the prnu
+			for j := 0; j < len(encInputs[0]); j++ { // NumRowEncIn
+				for k := 0; k < len(encInputs[0][0]); k++ { // NumColEncIn
+					//evaluator.Add(encRes[j][k], encInputs[i][j][k], encRes[j][k]) => encoded aggregation
 
-				// 1) Multiplication of the fingerprint "query" / estimation (1st party) with the residual of each image (rest of parties)
-				evaluator.Mul(encInputs[0][j][k], encInputs[i][j][k], resMult[i-1][j][k])
+					// 1) Multiplication of the fingerprint "query" / estimation (1st party) with the residual of each image (rest of parties)
+					evaluator.Mul(encInputs[0][j][k], encInputs[i][j][k], resMult[i-1][j][k])
+				}
 			}
 		}
-	}
 
-	for i := 0; i < len(resMult); i++ {
-		for j := 0; j < len(resMult[0]); j++ {
-			for k := 0; k < len(resMult[0][0]); k++ {
-				// 2) Addition of all the ciphertexts (BE CAREFUL WITH THE DEGREES)
-				evaluator.Add(resAdd[i], resMult[i][j][k], resAdd[i])
+		for i := 0; i < len(resMult); i++ {
+			for j := 0; j < len(resMult[0]); j++ {
+				for k := 0; k < len(resMult[0][0]); k++ {
+					// 2) Addition of all the ciphertexts (BE CAREFUL WITH THE DEGREES)
+					evaluator.Add(resAdd[i], resMult[i][j][k], resAdd[i])
+				}
 			}
+			// 3) Relinearization
+			evaluator.Relinearize(resAdd[i], resAdd[i]) // solo hay 1 ciphertext en cada party
 		}
-		// 3) Relinearization
-		evaluator.Relinearize(resAdd[i], resAdd[i]) // solo hay 1 ciphertext en cada party
-	}
 
-	for i := 0; i < len(encRes); i++ { // len(encRes) = len (resAdd)
-		// 4) InnerSum
-		evaluator.InnerSumLog(resAdd[i], 1, params.Slots(), encRes[i]) //encRes[i]->encRes[i] ( // batch, n = num of rotations ??)
-	}
+		for i := 0; i < len(encRes); i++ { // len(encRes) = len (resAdd)
+			// 4) InnerSum
+			evaluator.InnerSumLog(resAdd[i], 1, params.Slots(), encRes[i]) //encRes[i]->encRes[i] ( // batch, n = num of rotations ??)
+		}
+	})
+
+	elapsedEvalParty = time.Duration(0)
+	fmt.Printf("\tevalPhase done (cloud: %s, party: %s)\n", elapsedEvalCloudCPU, elapsedEvalParty)
 
 	return
 }
@@ -396,11 +490,13 @@ func pcksPhase(params ckks.Parameters, tpk *rlwe.PublicKey, encRes []*ckks.Ciphe
 		}
 	}
 
-	for _, pi := range P {
-		for i := range encRes {
-			pcks.GenShare(pi.sk, tpk, encRes[i].Value[1], pi.pcksShare[i])
+	elapsedPCKSParty = runTimedParty(func() {
+		for _, pi := range P {
+			for i := range encRes {
+				pcks.GenShare(pi.sk, tpk, encRes[i].Value[1], pi.pcksShare[i])
+			}
 		}
-	}
+	}, len(P))
 
 	pcksCombined := make([]*drlwe.PCKSShare, len(encRes))
 	encOut = make([]*ckks.Ciphertext, len(encRes))
@@ -409,15 +505,18 @@ func pcksPhase(params ckks.Parameters, tpk *rlwe.PublicKey, encRes []*ckks.Ciphe
 		encOut[i] = ckks.NewCiphertext(params, 1, 1, params.DefaultScale())
 	}
 
-	for _, pi := range P {
-		for i := range encRes {
-			pcks.AggregateShare(pi.pcksShare[i], pcksCombined[i], pcksCombined[i])
+	elapsedPCKSCloud = runTimed(func() {
+		for _, pi := range P {
+			for i := range encRes {
+				pcks.AggregateShare(pi.pcksShare[i], pcksCombined[i], pcksCombined[i])
+			}
 		}
-	}
+		for i := range encRes {
+			pcks.KeySwitch(encRes[i], pcksCombined[i], encOut[i]) // switching the key
+		}
+	})
 
-	for i := range encRes {
-		pcks.KeySwitch(encRes[i], pcksCombined[i], encOut[i]) // switching the key
-	}
+	fmt.Printf("\tpcksphase done (cloud: %s, party: %s)\n", elapsedPCKSCloud, elapsedPCKSParty)
 
 	return
 
