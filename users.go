@@ -153,10 +153,6 @@ func getDataTest(numExp int, numCam int, lengthX int, lengthY int) (map[string][
 
 }
 
-func cropImage(img *gocv.Mat, lengthX int, lengthY int) {
-
-}
-
 func fileExists(rute string) bool {
 
 	_, err := os.Stat(rute)

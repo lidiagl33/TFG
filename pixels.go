@@ -41,17 +41,39 @@ func pixelArrayGray(img *image.Gray, size image.Point, lengthX int, lengthY int)
 				}
 			}
 
+			var pixelsInRow = make([]float64, len(pixels)*len(pixels[0]))
+			var changeRow1 = 0
+
+			for i := 0; i < len(pixels); i++ {
+				for j := 0; j < len(pixels[0]); j++ {
+					pixelsInRow[i+j+changeRow1] = pixels[i][j].pix
+				}
+				changeRow1 += len(pixels[0]) - 1
+			}
+
 			var croppedPixels = make([][]PixelGray, lengthY)
 
 			for i := 0; i < len(croppedPixels); i++ {
 				croppedPixels[i] = make([]PixelGray, lengthX)
 			}
 
+			// when the dimensions selected (lengthX, lengthY) are less or equal than the original (3008x2000)
+
 			for y := 0; y < lengthY; y++ {
 				for x := 0; x < lengthX; x++ {
 					croppedPixels[y][x].pix = pixels[y][x].pix
 				}
 			}
+
+			// instead:
+
+			/*var changeRow2 = 0
+			for y := 0; y < lengthY; y++ {
+				for x := 0; x < lengthX; x++ {
+					croppedPixels[y][x].pix = pixelsInRow[y+x+changeRow2]
+				}
+				changeRow2 += lengthX - 1
+			}*/
 
 			return croppedPixels
 

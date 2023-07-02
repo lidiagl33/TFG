@@ -126,6 +126,7 @@ func calculateK(pixNum [][]PixelGray, pixDen [][]PixelGray) [][]PixelGray {
 }
 
 func calculateFinalK(K_B, K_G, K_R [][]PixelGray) [][]PixelGray {
+
 	//0.3*K_R+0.59*K_G+0.11*K_B
 
 	var finalK = make([][]PixelGray, len(K_B))
@@ -206,6 +207,7 @@ func calculateResidual(layers []gocv.Mat, residuals *[][][]PixelGray, lengthX in
 }
 
 func calculateFinalResidual(res_B, res_G, res_R [][]PixelGray) [][]PixelGray {
+
 	//0.3*res_R+0.59*res_G+0.11*res_B
 
 	var finalResidual = make([][]PixelGray, len(res_B))

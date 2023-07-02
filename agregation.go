@@ -1,6 +1,6 @@
 package main
 
-func agregation(prnus [][][]PixelGray, numUsers int, weights []float64) [][]PixelGray {
+func getAgregation(prnus [][][]PixelGray, numUsers int, weights []float64) [][]PixelGray {
 
 	// OPERATION TO MAKE: addition PRNUs / number of users
 
